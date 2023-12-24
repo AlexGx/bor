@@ -1205,6 +1205,124 @@ func (api *API) TraceTransaction(ctx context.Context, hash common.Hash, config *
 	return api.traceTx(ctx, msg, txctx, vmctx, statedb, config)
 }
 
+func customGetHashFn(ref *types.Header, chain core.ChainContext) func(n uint64) common.Hash {
+	// Cache will initially contain [refHash.parent],
+	// Then fill up with [refHash.p, refHash.pp, refHash.ppp, ...]
+	var cache []common.Hash
+
+	return func(n uint64) common.Hash {
+		// If there's no hash cache yet, make one
+		if len(cache) == 0 {
+			cache = append(cache, ref.ParentHash)
+		}
+		if n == ref.Number.Uint64() {
+			return ref.Hash()
+		}
+		if idx := ref.Number.Uint64() - n - 1; idx < uint64(len(cache)) {
+			return cache[idx]
+		}
+		// No luck in the cache, but we can start iterating from the last element we already know
+		lastKnownHash := cache[len(cache)-1]
+		lastKnownNumber := ref.Number.Uint64() - uint64(len(cache))
+
+		for {
+			header := chain.GetHeader(lastKnownHash, lastKnownNumber)
+			if header == nil {
+				break
+			}
+			cache = append(cache, header.ParentHash)
+			lastKnownHash = header.ParentHash
+			lastKnownNumber = header.Number.Uint64() - 1
+			if n == lastKnownNumber {
+				return lastKnownHash
+			}
+		}
+		return common.Hash{}
+	}
+}
+
+func (api *API) TraceCallMany(ctx context.Context, txs []ethapi.TransactionArgs, blockNrOrHash rpc.BlockNumberOrHash, config *TraceCallConfig) (interface{}, error) {
+	// Try to retrieve the specified block
+	var (
+		err   error
+		block *types.Block
+	)
+	if hash, ok := blockNrOrHash.Hash(); ok {
+		block, err = api.blockByHash(ctx, hash)
+	} else if number, ok := blockNrOrHash.Number(); ok {
+		if number == rpc.PendingBlockNumber { // @review: is this logic affects our case
+			// We don't have access to the miner here. For tracing 'future' transactions,
+			// it can be done with block- and state-overrides instead, which offers
+			// more flexibility and stability than trying to trace on 'pending', since
+			// the contents of 'pending' is unstable and probably not a true representation
+			// of what the next actual block is likely to contain.
+			return nil, errors.New("tracing on top of pending is not supported")
+		}
+
+		block, err = api.blockByNumber(ctx, number)
+	} else {
+		return nil, errors.New("invalid arguments; neither block nor hash specified")
+	}
+	if err != nil {
+		return nil, err
+	}
+	// try to recompute the state
+	reexec := defaultTraceReexec
+	if config != nil && config.Reexec != nil {
+		reexec = *config.Reexec
+	}
+	statedb, release, err := api.backend.StateAtBlock(ctx, block, reexec, nil, true, false)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	vmctx := core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
+
+	// Apply the customization rules if required.
+	var traceConfig *TraceConfig
+	if config != nil {
+		if err := config.StateOverrides.Apply(statedb); err != nil {
+			return nil, err
+		}
+
+		config.BlockOverrides.Apply(&vmctx)
+
+		traceConfig = &TraceConfig{
+			Config:       config.Config,
+			Tracer:       config.Tracer,
+			Timeout:      config.Timeout,
+			Reexec:       config.Reexec,
+			TracerConfig: config.TracerConfig,
+		}
+	}
+
+	// Intended to trace only on the latest block, assuming that it's pending block
+	vmctx.BlockNumber.Add(vmctx.BlockNumber, big.NewInt(1))
+	// vmctx.Time.Add(vmctx.Time, big.NewInt(3)) // @note: previously time was BigInt
+	vmctx.Time += 3
+	vmctx.GetHash = customGetHashFn(block.Header(), api.chainContext(ctx)) // @review: experiment (disable etc.) with this
+
+	var results = make([]interface{}, len(txs))
+	for idx, args := range txs {
+		// Execute the trace
+		msg, err := args.ToMessage(api.backend.RPCGasCap(), block.BaseFee())
+		if err != nil {
+			results[idx] = &txTraceResult{Error: err.Error()}
+			continue
+		}
+		// Trace the transaction and return
+		res, err := api.traceTx(ctx, msg, new(Context), vmctx, statedb, traceConfig)
+		if err != nil {
+			results[idx] = &txTraceResult{Error: err.Error()}
+			continue
+		}
+		results[idx] = res
+	}
+
+	return results, nil
+}
+
 // TraceCall lets you trace a given eth_call. It collects the structured logs
 // created during the execution of EVM if the given transaction was added on
 // top of the provided block and returns them as a JSON object.
